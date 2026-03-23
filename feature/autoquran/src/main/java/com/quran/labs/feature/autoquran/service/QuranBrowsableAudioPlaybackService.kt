@@ -19,6 +19,7 @@ import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.SettableFuture
+import com.quran.labs.androidquran.common.audio.repository.CurrentQariManager
 import com.quran.labs.feature.autoquran.common.BrowsableSurahBuilder
 import com.quran.labs.feature.autoquran.common.RecentQariManager
 import com.quran.labs.feature.autoquran.di.QuranAutoInjector
@@ -39,7 +40,11 @@ class QuranBrowsableAudioPlaybackService : MediaLibraryService() {
   @Inject
   lateinit var recentQariManager: RecentQariManager
 
+  @Inject
+  lateinit var currentQariManager: CurrentQariManager
+
   private var mediaSession: MediaLibrarySession? = null
+  @Volatile private var cachedSearch: Pair<String, List<MediaItem>>? = null
 
   private val playerListener = PlayerEventListener()
   private val quranAudioAttributes = AudioAttributes.Builder()
@@ -47,13 +52,7 @@ class QuranBrowsableAudioPlaybackService : MediaLibraryService() {
     .setUsage(C.USAGE_MEDIA)
     .build()
 
-  private val exoPlayer: Player by lazy {
-    ExoPlayer.Builder(this).build().apply {
-      setAudioAttributes(quranAudioAttributes, true)
-      setHandleAudioBecomingNoisy(true)
-      addListener(playerListener)
-    }
-  }
+  private var exoPlayer: Player? = null
 
   private val rootMediaItem: MediaItem by lazy {
     MediaItem.Builder()
@@ -61,7 +60,7 @@ class QuranBrowsableAudioPlaybackService : MediaLibraryService() {
       .setMediaMetadata(
         MediaMetadata.Builder()
           .setIsBrowsable(true)
-          .setMediaType(MediaMetadata.MEDIA_TYPE_MIXED)
+          .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
           .setIsPlayable(false)
           .build()
       )
@@ -74,7 +73,7 @@ class QuranBrowsableAudioPlaybackService : MediaLibraryService() {
       .setMediaMetadata(
         MediaMetadata.Builder()
           .setIsBrowsable(true)
-          .setMediaType(MediaMetadata.MEDIA_TYPE_MIXED)
+          .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
           .setIsPlayable(false)
           .build()
       )
@@ -88,30 +87,36 @@ class QuranBrowsableAudioPlaybackService : MediaLibraryService() {
     val injector = (application as? QuranApplicationComponentProvider)
       ?.provideQuranApplicationComponent() as? QuranAutoInjector
     if (injector == null) {
-      Timber.e("Unable to inject QuranBrowsableAudioPlaybackService (component missing or wrong type)")
-    } else {
-      injector.inject(this)
+      Timber.e(
+        "Unable to inject QuranBrowsableAudioPlaybackService" +
+          " (component missing or wrong type)"
+      )
+      stopSelf()
+      return
     }
+    injector.inject(this)
 
-    mediaSession = MediaLibrarySession.Builder(this, exoPlayer, QuranServiceCallback()).build()
+    val player = ExoPlayer.Builder(this).build().apply {
+      setAudioAttributes(quranAudioAttributes, true)
+      setHandleAudioBecomingNoisy(true)
+      addListener(playerListener)
+    }
+    exoPlayer = player
+
+    mediaSession = MediaLibrarySession.Builder(
+      this, player, QuranServiceCallback()
+    ).build()
   }
 
   override fun onDestroy() {
     scope.cancel()
-    val mediaSession = mediaSession
-    if (mediaSession != null) {
-      mediaSession.player.apply {
-        removeListener(playerListener)
-        release()
-      }
-      mediaSession.release()
-      this.mediaSession = null
-    } else {
-      exoPlayer.apply {
-        removeListener(playerListener)
-        release()
-      }
+    exoPlayer?.apply {
+      removeListener(playerListener)
+      release()
     }
+    exoPlayer = null
+    mediaSession?.release()
+    mediaSession = null
     super.onDestroy()
   }
 
@@ -122,20 +127,34 @@ class QuranBrowsableAudioPlaybackService : MediaLibraryService() {
     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
       if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) return
       val mediaId = mediaItem?.mediaId ?: return
-      if (!mediaId.startsWith("sura_")) return
       val parts = mediaId.split("_")
-      if (parts.size != 3) return
-      val sura = parts[1].toIntOrNull() ?: return
-      val qariId = parts[2].toIntOrNull() ?: return
+
+      val sura: Int
+      val qariId: Int
+      if (mediaId.startsWith("sura_") && parts.size == 3) {
+        sura = parts[1].toIntOrNull() ?: return
+        qariId = parts[2].toIntOrNull() ?: return
+      } else if (mediaId.startsWith("ayah_") && parts.size == 4) {
+        sura = parts[1].toIntOrNull() ?: return
+        qariId = parts[3].toIntOrNull() ?: return
+      } else {
+        return
+      }
+
       if (::recentQariManager.isInitialized) {
         recentQariManager.recordQari(qariId, sura)
         val recentCount = recentQariManager.getRecentQaris().size
         mediaSession?.notifyChildrenChanged(
           BrowsableSurahBuilder.RECENT_ID, recentCount, null
         )
+      }
+      if (::surahBuilder.isInitialized) {
         mediaSession?.notifyChildrenChanged(
-          BrowsableSurahBuilder.ROOT_ID, 2, null
+          BrowsableSurahBuilder.ROOT_ID, surahBuilder.rootChildCount(), null
         )
+      }
+      if (::currentQariManager.isInitialized) {
+        currentQariManager.setCurrentQari(qariId)
       }
     }
   }
@@ -165,8 +184,14 @@ class QuranBrowsableAudioPlaybackService : MediaLibraryService() {
         )
       }
       val rootExtras = Bundle().apply {
-        putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM)
-        putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM)
+        putInt(
+          MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE,
+          MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM
+        )
+        putInt(
+          MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE,
+          MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM
+        )
       }
       val libraryParams = MediaLibraryService.LibraryParams.Builder().setExtras(rootExtras).build()
       return Futures.immediateFuture(LibraryResult.ofItem(rootMediaItem, libraryParams))
@@ -187,7 +212,7 @@ class QuranBrowsableAudioPlaybackService : MediaLibraryService() {
             LibraryResult.ofItem(item, MediaLibraryService.LibraryParams.Builder().build())
           }
         }.getOrElse { t ->
-          Timber.e("onGetItem failed for mediaId=$mediaId", t)
+          Timber.e(t, "onGetItem failed for mediaId=$mediaId")
           LibraryResult.ofError(SessionError.ERROR_UNKNOWN)
         }
         settable.set(result)
@@ -210,7 +235,7 @@ class QuranBrowsableAudioPlaybackService : MediaLibraryService() {
           val children = surahBuilder.children(parentId)
           LibraryResult.ofItemList(children, MediaLibraryService.LibraryParams.Builder().build())
         }.getOrElse { t ->
-          Timber.e("onGetChildren failed for parentId=$parentId", t)
+          Timber.e(t, "onGetChildren failed for parentId=$parentId")
           // Important: always respond, otherwise Android Auto can show an infinite spinner.
           LibraryResult.ofError(SessionError.ERROR_UNKNOWN)
         }
@@ -227,9 +252,32 @@ class QuranBrowsableAudioPlaybackService : MediaLibraryService() {
       val settable = SettableFuture.create<List<MediaItem>>()
       scope.launch {
         val items = runCatching {
-          mediaItems.mapNotNull { surahBuilder.child(it.mediaId) }
+          var resolved = mediaItems.mapNotNull { item ->
+            val child = surahBuilder.child(item.mediaId)
+            if (child != null && child.localConfiguration?.uri == null) {
+              // Gapped reciter surah item has no URI; expand to per-ayah items
+              return@mapNotNull null
+            }
+            child
+          }
+
+          // Handle gapped reciter items: expand to per-ayah playlist
+          if (resolved.isEmpty() && mediaItems.isNotEmpty()) {
+            val firstItem = mediaItems.first()
+            // Check for voice search query
+            val searchQuery = firstItem.requestMetadata.searchQuery
+            resolved = if (searchQuery != null) {
+              surahBuilder.search(searchQuery)
+            } else if (firstItem.mediaId.startsWith("sura_")) {
+              surahBuilder.expandMediaItem(firstItem.mediaId).toList()
+            } else {
+              emptyList()
+            }
+          }
+
+          resolved
         }.getOrElse { t ->
-          Timber.e("onAddMediaItems failed", t)
+          Timber.e(t, "onAddMediaItems failed")
           emptyList()
         }
         settable.set(items)
@@ -254,7 +302,7 @@ class QuranBrowsableAudioPlaybackService : MediaLibraryService() {
             val startPosition = if (index != -1) index else 0
             MediaSession.MediaItemsWithStartPosition(items, startPosition, 0)
           }.getOrElse { t ->
-            Timber.e("onSetMediaItems failed", t)
+            Timber.e(t, "onSetMediaItems failed")
             MediaSession.MediaItemsWithStartPosition(ImmutableList.of(), 0, 0)
           }
           settable.set(result)
@@ -280,10 +328,14 @@ class QuranBrowsableAudioPlaybackService : MediaLibraryService() {
       val settable = SettableFuture.create<LibraryResult<Void>>()
       scope.launch {
         val result = runCatching {
-          session.notifySearchResultChanged(browser, query, surahBuilder.search(query).size, params)
+          val results = surahBuilder.search(query)
+          cachedSearch = query to results
+          session.notifySearchResultChanged(
+            browser, query, results.size, params
+          )
           LibraryResult.ofVoid(params)
         }.getOrElse { t ->
-          Timber.e("onSearch failed for query=$query", t)
+          Timber.e(t, "onSearch failed for query=$query")
           LibraryResult.ofError(SessionError.ERROR_UNKNOWN)
         }
         settable.set(result)
@@ -299,13 +351,22 @@ class QuranBrowsableAudioPlaybackService : MediaLibraryService() {
       pageSize: Int,
       params: MediaLibraryService.LibraryParams?
     ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
-      val settable = SettableFuture.create<LibraryResult<ImmutableList<MediaItem>>>()
+      val settable =
+        SettableFuture.create<LibraryResult<ImmutableList<MediaItem>>>()
       scope.launch {
         val result = runCatching {
-          val items = surahBuilder.search(query)
-          LibraryResult.ofItemList(items, MediaLibraryService.LibraryParams.Builder().build())
+          val cached = cachedSearch
+          val items = if (cached != null && cached.first == query) {
+            cached.second
+          } else {
+            surahBuilder.search(query)
+          }
+          LibraryResult.ofItemList(
+            items,
+            MediaLibraryService.LibraryParams.Builder().build()
+          )
         }.getOrElse { t ->
-          Timber.e("onGetSearchResult failed for query=$query", t)
+          Timber.e(t, "onGetSearchResult failed for query=$query")
           LibraryResult.ofError(SessionError.ERROR_UNKNOWN)
         }
         settable.set(result)

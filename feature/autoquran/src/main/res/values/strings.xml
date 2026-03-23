@@ -2,4 +2,7 @@
   <string name="quran_sura_title">Surah %1$s</string>
   <string name="autoquran_qaris_title">Qaris</string>
   <string name="autoquran_recently_played_title">Recently Played</string>
+  <string name="autoquran_surahs_title">Surahs</string>
+  <string name="autoquran_juz_title">Juz\'</string>
+  <string name="autoquran_juz_number_title">Juz\' %1$d</string>
 </resources>

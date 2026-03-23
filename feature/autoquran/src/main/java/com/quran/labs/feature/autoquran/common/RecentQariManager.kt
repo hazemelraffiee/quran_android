@@ -15,6 +15,8 @@ class RecentQariManager @Inject constructor(
   private val prefs: SharedPreferences =
     appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+  private val lock = Any()
+
   private val adapter = Moshi.Builder().build().adapter<List<RecentQari>>(
     Types.newParameterizedType(List::class.java, RecentQari::class.java)
   )
@@ -30,11 +32,15 @@ class RecentQariManager @Inject constructor(
   }
 
   fun recordQari(qariId: Int, sura: Int) {
-    val current = getRecentQaris().toMutableList()
-    current.removeAll { it.qariId == qariId && it.lastSura == sura }
-    current.add(0, RecentQari(qariId, sura, System.currentTimeMillis()))
-    val trimmed = current.take(MAX_RECENT)
-    prefs.edit().putString(KEY_RECENT_QARIS, adapter.toJson(trimmed)).apply()
+    synchronized(lock) {
+      val current = getRecentQaris().toMutableList()
+      current.removeAll { it.qariId == qariId && it.lastSura == sura }
+      current.add(0, RecentQari(qariId, sura, System.currentTimeMillis()))
+      val trimmed = current.take(MAX_RECENT)
+      prefs.edit()
+        .putString(KEY_RECENT_QARIS, adapter.toJson(trimmed))
+        .apply()
+    }
   }
 
   companion object {
