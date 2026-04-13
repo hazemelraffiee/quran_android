@@ -44,6 +44,11 @@
       tools:replace="android:fullBackupContent,android:dataExtractionRules"
       tools:targetApi="tiramisu">
 
+    <!-- Declares the app as an Android Auto media provider. -->
+    <meta-data
+        android:name="com.google.android.gms.car.application"
+        android:resource="@xml/automotive_app_desc" />
+
     <activity
         android:name=".QuranDataActivity"
         android:configChanges="keyboardHidden|orientation|screenSize"
@@ -173,12 +178,19 @@
         android:name=".service.QuranDownloadService"
         android:foregroundServiceType="dataSync"/>
 
+    <!-- exported="true" is required for Android Auto to discover the MediaLibraryService. -->
     <service
-        android:exported="false"
+        android:exported="true"
         android:name=".service.AudioService"
-        android:foregroundServiceType="mediaPlayback">
+        android:foregroundServiceType="mediaPlayback"
+        tools:ignore="ExportedService">
       <intent-filter>
+        <action android:name="androidx.media3.session.MediaLibraryService"/>
+        <action android:name="android.media.browse.MediaBrowserService"/>
         <action android:name="android.intent.action.MEDIA_BUTTON"/>
+        <!-- Android Auto / system media search. Currently delegates to default -->
+        <!-- MediaLibrarySession.Callback.onSearch; custom behavior lands in Cycle 3. -->
+        <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH"/>
       </intent-filter>
     </service>
 
