@@ -9,6 +9,7 @@ import com.quran.labs.androidquran.common.audio.model.download.AudioDownloadMeta
 import com.quran.labs.androidquran.common.audio.model.playback.AudioPathInfo
 import com.quran.labs.androidquran.common.audio.model.playback.AudioRequest
 import com.quran.labs.androidquran.common.audio.util.AudioExtensionDecider
+import com.quran.labs.androidquran.common.audio.util.AudioPathInfoBuilder
 import com.quran.labs.androidquran.data.QuranDisplayInterface
 import com.quran.labs.androidquran.presenter.Presenter
 import com.quran.labs.androidquran.service.QuranDownloadService
@@ -27,6 +28,7 @@ constructor(
   private val quranDisplayData: QuranDisplayInterface,
   private val audioUtil: AudioUtilsInterface,
   private val audioExtensionDecider: AudioExtensionDecider,
+  private val audioPathInfoBuilder: AudioPathInfoBuilder,
   private val quranFileUtils: AudioFileUtils
 ) : Presenter<AudioPresenterScreen> {
   private var pagerActivity: AudioPresenterScreen? = null
@@ -192,20 +194,11 @@ constructor(
 
   private fun getLocalAudioPathInfo(qari: QariItem): AudioPathInfo? {
     pagerActivity?.let {
-      val localPath = audioUtil.getLocalQariUrl(qari)
-      if (localPath != null) {
-        val databasePath = audioUtil.getQariDatabasePathIfGapless(qari)
-        val extension = audioExtensionDecider.audioExtensionForQari(qari)
-        val urlFormat = if (databasePath.isNullOrEmpty()) {
-          localPath + File.separator + "%d" + File.separator + "%d" + ".$extension"
-        } else {
-          localPath + File.separator + "%03d" + ".$extension"
-        }
-        return AudioPathInfo(
-          urlFormat, localPath, databasePath,
-          audioExtensionDecider.allowedAudioExtensions(qari)
-        )
-      }
+      return audioPathInfoBuilder.build(
+        qari,
+        audioUtil.getLocalQariUrl(qari),
+        audioUtil.getQariDatabasePathIfGapless(qari),
+      )
     }
     return null
   }

@@ -1,4 +1,4 @@
-package com.quran.labs.feature.autoquran.service
+package com.quran.labs.feature.autoquran.common
 
 import android.os.SystemClock
 import androidx.media3.common.MediaItem

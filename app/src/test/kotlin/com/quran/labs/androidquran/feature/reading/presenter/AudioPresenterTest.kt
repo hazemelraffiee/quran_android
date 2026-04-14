@@ -6,6 +6,7 @@ import com.google.common.truth.Truth.assertThat
 import com.quran.data.model.SuraAyah
 import com.quran.labs.androidquran.base.TestApplication
 import com.quran.labs.androidquran.common.audio.model.QariItem
+import com.quran.labs.androidquran.common.audio.util.AudioPathInfoBuilder
 import com.quran.labs.androidquran.fakes.FakeAudioExtensionDecider
 import com.quran.labs.androidquran.fakes.FakeAudioFileUtils
 import com.quran.labs.androidquran.fakes.FakeAudioPresenterScreen
@@ -92,6 +93,7 @@ class AudioPresenterTest {
       quranDisplayData = fakeQuranDisplayData,
       audioUtil = fakeAudioUtils,
       audioExtensionDecider = fakeAudioExtensionDecider,
+      audioPathInfoBuilder = AudioPathInfoBuilder(fakeAudioExtensionDecider),
       quranFileUtils = fakeAudioFileUtils
     )
   }
