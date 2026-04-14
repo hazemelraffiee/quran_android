@@ -176,8 +176,16 @@ class AudioService : MediaLibraryService(), Player.Listener, StartPlaybackCallba
   @Inject
   lateinit var recentQariManager: com.quran.labs.feature.autoquran.common.RecentQariManager
 
+  @Inject
+  lateinit var qariArtworkProvider: com.quran.labs.feature.autoquran.common.QariArtworkProvider
+
   private var recentPlaybackRecorder: com.quran.labs.feature.autoquran.common.RecentPlaybackRecorder? = null
   private val playerTransitionListener = PlayerTransitionListener()
+
+  // Tracks the sura last used for Media3 MediaMetadata updates. Metadata is refreshed
+  // only on sura change, not per ayah — per-ayah churn is expensive and unnecessary
+  // for the Auto / lock-screen UI which shows sura-level info.
+  private var lastMetadataSura: Int? = null
 
   @Inject
   lateinit var quranSettings: QuranSettings
@@ -332,12 +340,18 @@ class AudioService : MediaLibraryService(), Player.Listener, StartPlaybackCallba
 
   @OptIn(UnstableApi::class)
   private fun buildMediaSource(uri: Uri): MediaSource {
+    return buildMediaSource(MediaItem.fromUri(uri))
+  }
+
+  @OptIn(UnstableApi::class)
+  private fun buildMediaSource(mediaItem: MediaItem): MediaSource {
+    val uri = mediaItem.localConfiguration?.uri ?: Uri.EMPTY
     val dataSourceFactory = if (uri.scheme == "http" || uri.scheme == "https") {
       buildCachedDataSourceFactory()
     } else {
       buildDefaultDataSourceFactory()
     }
-    return DefaultMediaSourceFactory(dataSourceFactory).createMediaSource(MediaItem.fromUri(uri))
+    return DefaultMediaSourceFactory(dataSourceFactory).createMediaSource(mediaItem)
   }
 
   override fun onCreate() {
@@ -900,6 +914,50 @@ class AudioService : MediaLibraryService(), Player.Listener, StartPlaybackCallba
       )
     }
     mediaSession.setMetadata(metadataBuilder.build())
+
+    // Media3 side: update the session's current MediaItem metadata when the sura
+    // changes. This is what Android Auto + the system media notification read.
+    maybeUpdateSessionMetadata()
+  }
+
+  /**
+   * If the audio queue has advanced to a different sura than the one we last wrote
+   * Media3 MediaMetadata for, rebuild MediaMetadata and attach it to the current
+   * player MediaItem. No-op when the sura is unchanged — keeps per-ayah churn out
+   * of the session's metadata stream.
+   */
+  private fun maybeUpdateSessionMetadata() {
+    val localPlayer = player ?: return
+    val localAudioQueue = audioQueue ?: return
+    val localAudioRequest = audioRequest ?: return
+    val currentSura = localAudioQueue.getCurrentSura()
+    if (currentSura == lastMetadataSura) return
+    val current = localPlayer.currentMediaItem ?: return
+    val metadata = buildSessionMediaMetadata(currentSura, localAudioRequest)
+    val updated = current.buildUpon().setMediaMetadata(metadata).build()
+    try {
+      localPlayer.replaceMediaItem(localPlayer.currentMediaItemIndex, updated)
+      lastMetadataSura = currentSura
+    } catch (e: IllegalStateException) {
+      Timber.w(e, "replaceMediaItem failed; metadata update skipped")
+    }
+  }
+
+  private fun buildSessionMediaMetadata(
+    sura: Int,
+    request: AudioRequest,
+  ): androidx.media3.common.MediaMetadata {
+    val suraName = quranDisplayData.getSuraName(applicationContext, sura, true)
+    val artworkUri = qariArtworkProvider.suraArtworkUriFor(request.qari.id, sura)
+    return androidx.media3.common.MediaMetadata.Builder()
+      .setTitle(suraName)
+      .setDisplayTitle(suraName)
+      .setArtist(request.qari.name)
+      .setArtworkUri(artworkUri)
+      .setTrackNumber(sura)
+      .setTotalTrackCount(114)
+      .setIsPlayable(true)
+      .build()
   }
 
   private fun updateAudioPlaybackStatus() {
@@ -1078,7 +1136,18 @@ class AudioService : MediaLibraryService(), Player.Listener, StartPlaybackCallba
           overrideResource = 0
           url.toUri()
         }
-        val mediaSource = buildMediaSource(mediaUri)
+        // Attach sura/qari MediaMetadata for non-override items so Auto + system
+        // notification show the correct now-playing info as soon as playback starts.
+        // Override (basmallah/isti3atha) items stay bare — they're brief and the
+        // following regular item's metadata supersedes on the next notifyAyahChanged.
+        val mediaSource = if (overrideResource == 0) {
+          val metadata = buildSessionMediaMetadata(localAudioQueue.getCurrentSura(), localAudioRequest)
+          val mediaItem = MediaItem.Builder().setUri(mediaUri).setMediaMetadata(metadata).build()
+          lastMetadataSura = localAudioQueue.getCurrentSura()
+          buildMediaSource(mediaItem)
+        } else {
+          buildMediaSource(mediaUri)
+        }
 
         val potentialTiming = if (timings != null && overrideResource == 0) {
           getSeekPosition(false)

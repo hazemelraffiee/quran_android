@@ -38,13 +38,15 @@ class QariArtworkProvider @Inject constructor(
       .build()
   }
 
-  fun suraArtworkUriFor(qari: Qari, sura: Int): Uri {
+  fun suraArtworkUriFor(qari: Qari, sura: Int): Uri = suraArtworkUriFor(qari.id, sura)
+
+  fun suraArtworkUriFor(qariId: Int, sura: Int): Uri {
     return Uri.Builder()
       .scheme("content")
       .authority(authority(appContext))
       .appendPath(QariArtworkContentProvider.PATH_ARTWORK)
       .appendPath(QariArtworkContentProvider.PATH_QARI)
-      .appendPath(qari.id.toString())
+      .appendPath(qariId.toString())
       .appendPath(QariArtworkContentProvider.PATH_SURA)
       .appendPath(sura.toString())
       .build()
