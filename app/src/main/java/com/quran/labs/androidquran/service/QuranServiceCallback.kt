@@ -45,7 +45,20 @@ import timber.log.Timber
  * and its own session callback.
  */
 interface StartPlaybackCallback {
+  /**
+   * Full-reset playback entry — stops the player, clears the queue, starts fresh.
+   * Used by the intent path (`ACTION_PLAYBACK`) where the caller owns the play state.
+   */
   fun startPlayback(request: AudioRequest)
+
+  /**
+   * State-sync entry — updates `audioQueue`/`audioRequest` to match the current
+   * session playlist item without touching the ExoPlayer. Used by the Auto path,
+   * where Media3 drives actual playback from a multi-sura playlist and the service
+   * only needs its in-memory state aligned (for word-highlighting, status flow,
+   * gapless timing lookup).
+   */
+  fun syncPlaybackStateTo(request: AudioRequest)
 }
 
 @OptIn(UnstableApi::class)
@@ -211,8 +224,11 @@ class QuranServiceCallback @Inject constructor(
           val audioRequest = buildAudioRequest(sura, qariId)
           if (audioRequest != null) {
             scope.launch { currentQariManager.setCurrentQari(qariId) }
-            startPlaybackCallback?.startPlayback(audioRequest)
-              ?: Timber.w("startPlaybackCallback is null; Auto play request dropped")
+            // State-sync only — Media3 drives playback from the returned 114-item
+            // playlist. Using startPlayback here would replace the player's playlist
+            // with a single item and break Auto's cross-sura navigation.
+            startPlaybackCallback?.syncPlaybackStateTo(audioRequest)
+              ?: Timber.w("startPlaybackCallback is null; Auto sync request dropped")
           }
         } else {
           Timber.w("onSetMediaItems received unparseable mediaId=$mediaId")

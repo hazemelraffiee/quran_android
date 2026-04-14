@@ -192,11 +192,30 @@ class AudioService : MediaLibraryService(), Player.Listener, StartPlaybackCallba
    * timing-data reads when the current sura changes mid-playback (e.g., Auto auto-advance).
    */
   override fun startPlayback(request: AudioRequest) {
-    startPlaybackInternal(request)
+    stopUpdateAudioPositionJob()
+    setAudioRequestState(request)
+    Timber.d("audio request has changed...")
+    player?.stop()
+    state = State.Stopped
+    Timber.d("stop if playing...")
+    processTogglePlaybackRequest()
   }
 
-  private fun startPlaybackInternal(updatedAudioRequest: AudioRequest) {
+  /**
+   * Auto path: the session's 114-item playlist drives ExoPlayer; we only need to keep
+   * in-service state aligned so word-highlighting + position updates + status flow
+   * keep working as ExoPlayer advances through suras.
+   */
+  override fun syncPlaybackStateTo(request: AudioRequest) {
     stopUpdateAudioPositionJob()
+    setAudioRequestState(request)
+    if (state == State.Playing) {
+      startUpdateAudioPositionJob(200)
+    }
+    updateAudioPlaybackStatus()
+  }
+
+  private fun setAudioRequestState(updatedAudioRequest: AudioRequest) {
     audioRequest = updatedAudioRequest
     val start = updatedAudioRequest.start
     val basmallah = !updatedAudioRequest.isGapless() && start.requiresBasmallah()
@@ -204,11 +223,6 @@ class AudioService : MediaLibraryService(), Player.Listener, StartPlaybackCallba
       quranInfo, updatedAudioRequest,
       AudioPlaybackInfo(start, 1, 1, basmallah)
     )
-    Timber.d("audio request has changed...")
-    player?.stop()
-    state = State.Stopped
-    Timber.d("stop if playing...")
-    processTogglePlaybackRequest()
   }
 
   private fun startUpdateAudioPositionJob(delayMs: Long) {
@@ -431,9 +445,10 @@ class AudioService : MediaLibraryService(), Player.Listener, StartPlaybackCallba
       val sura = rest.substringBefore("_").toIntOrNull() ?: return
       val qariId = rest.substringAfter("_", missingDelimiterValue = "").toIntOrNull() ?: return
 
-      // Reconstruct AudioQueue for the new sura via the same entry point Auto uses.
+      // Reconstruct AudioQueue for the new sura via the state-sync path — ExoPlayer
+      // already advanced the playlist on its own; we just realign in-service state.
       val request = quranServiceCallback.buildAudioRequestInternal(sura, qariId) ?: return
-      startPlayback(request)
+      syncPlaybackStateTo(request)
     }
 
     override fun onIsPlayingChanged(isPlaying: Boolean) {
