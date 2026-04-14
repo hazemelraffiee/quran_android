@@ -93,7 +93,7 @@ import androidx.core.net.toUri
  * (which come from our main activity, [PagerActivity], which signal
  * the service to perform specific operations: Play, Pause, Rewind, Skip, etc.
  */
-class AudioService : MediaLibraryService(), Player.Listener {
+class AudioService : MediaLibraryService(), Player.Listener, StartPlaybackCallback {
 
   private var mediaLibrarySession: MediaLibrarySession? = null
 
@@ -153,7 +153,6 @@ class AudioService : MediaLibraryService(), Player.Listener {
   private var currentWord: Int? = null
   private val compositeDisposable = CompositeDisposable()
   private lateinit var scope: CoroutineScope
-  private val quranServiceCallback = QuranServiceCallback()
   private var updateAudioPositionJob: Job? = null
 
   @Inject
@@ -172,7 +171,45 @@ class AudioService : MediaLibraryService(), Player.Listener {
   lateinit var timingRepository: TimingRepository
 
   @Inject
+  lateinit var quranServiceCallback: QuranServiceCallback
+
+  @Inject
+  lateinit var recentQariManager: com.quran.labs.feature.autoquran.common.RecentQariManager
+
+  private var recentPlaybackRecorder: com.quran.labs.feature.autoquran.common.RecentPlaybackRecorder? = null
+  private val playerTransitionListener = PlayerTransitionListener()
+
+  @Inject
   lateinit var quranSettings: QuranSettings
+
+  /**
+   * Single entry point for starting playback from a new [AudioRequest]. Called by both the
+   * intent-dispatch path (`ACTION_PLAYBACK`) and, from Cycle 3 onwards, by the Android Auto
+   * [QuranMediaLibraryCallback.onSetMediaItems] path. Always dispatched on the service's
+   * main-thread `scope` so `audioQueue`/`audioRequest`/`state` mutations stay serialized.
+   *
+   * Cancels any in-flight position-update job before mutating state — prevents stale
+   * timing-data reads when the current sura changes mid-playback (e.g., Auto auto-advance).
+   */
+  override fun startPlayback(request: AudioRequest) {
+    startPlaybackInternal(request)
+  }
+
+  private fun startPlaybackInternal(updatedAudioRequest: AudioRequest) {
+    stopUpdateAudioPositionJob()
+    audioRequest = updatedAudioRequest
+    val start = updatedAudioRequest.start
+    val basmallah = !updatedAudioRequest.isGapless() && start.requiresBasmallah()
+    audioQueue = AudioQueue(
+      quranInfo, updatedAudioRequest,
+      AudioPlaybackInfo(start, 1, 1, basmallah)
+    )
+    Timber.d("audio request has changed...")
+    player?.stop()
+    state = State.Stopped
+    Timber.d("stop if playing...")
+    processTogglePlaybackRequest()
+  }
 
   private fun startUpdateAudioPositionJob(delayMs: Long) {
     stopUpdateAudioPositionJob()
@@ -227,6 +264,9 @@ class AudioService : MediaLibraryService(), Player.Listener {
 
       // Set up listener for playback events
       localPlayer.addListener(this)
+      // Rebind the Auto transition listener on the (possibly re-created) player so
+      // sura→sura transitions keep rebuilding AudioQueue even after relaxResources.
+      localPlayer.addListener(playerTransitionListener)
 
       // Configure audio attributes for music playback
       val audioAttributes = AudioAttributes.Builder()
@@ -326,10 +366,79 @@ class AudioService : MediaLibraryService(), Player.Listener {
 
     // Create the ExoPlayer + MediaLibrarySession. The session owns Android Auto
     // discovery and lock-screen/media-button routing. Removing MediaSessionCompat
-    // is deferred to Cycle 3 once a custom MediaNotification.Provider is in place.
+    // is deferred to a follow-up once a custom MediaNotification.Provider is in place.
     val initialPlayer = makeOrResetExoPlayer()
+    quranServiceCallback.attach(this)
+    val pagerActivityIntent = Intent(applicationContext, PagerActivity::class.java).apply {
+      flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+    }
+    val sessionActivityPendingIntent = PendingIntent.getActivity(
+      applicationContext,
+      REQUEST_CODE_MAIN,
+      pagerActivityIntent,
+      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
     mediaLibrarySession = MediaLibrarySession.Builder(this, initialPlayer, quranServiceCallback)
+      .setSessionActivity(sessionActivityPendingIntent)
       .build()
+
+    // Install the player-transition listener + RecentPlaybackRecorder on the session
+    // player so sura→sura transitions (Auto's 114-item playlist advance) rebuild
+    // AudioQueue for the new sura, and cross-surface plays all record recents.
+    initialPlayer.addListener(playerTransitionListener)
+    recentPlaybackRecorder = buildRecentPlaybackRecorder(initialPlayer)
+  }
+
+  override fun onTaskRemoved(rootIntent: Intent?) {
+    // User swiped the app from Recents. Release cleanly rather than lingering.
+    Timber.i("debug: onTaskRemoved — stopping service")
+    stopSelf()
+  }
+
+  private fun buildRecentPlaybackRecorder(
+    player: ExoPlayer,
+  ): com.quran.labs.feature.autoquran.common.RecentPlaybackRecorder {
+    val handler = Handler(player.applicationLooper)
+    val delayedExecutor =
+      object : com.quran.labs.feature.autoquran.common.RecentPlaybackRecorder.DelayedExecutor {
+        override fun postDelayed(runnable: Runnable, delayMs: Long) {
+          handler.postDelayed(runnable, delayMs)
+        }
+
+        override fun removeCallbacks(runnable: Runnable) {
+          handler.removeCallbacks(runnable)
+        }
+      }
+    return com.quran.labs.feature.autoquran.common.RecentPlaybackRecorder(
+      delayedExecutor = delayedExecutor,
+      onRecord = { qariId, sura -> recentQariManager.recordQari(qariId, sura) },
+    )
+  }
+
+  /**
+   * Bridges ExoPlayer's native playlist transitions into our per-sura AudioQueue rebuild.
+   * Only sura-id mediaItems (`sura_<sura>_<qariId>`) trigger startPlayback — phone-path
+   * bare-URI items are ignored. Repeat transitions are also skipped to avoid re-entry.
+   */
+  private inner class PlayerTransitionListener : Player.Listener {
+    override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+      recentPlaybackRecorder?.onMediaItemTransition(mediaItem, player?.isPlaying == true)
+      if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) return
+
+      val id = mediaItem?.mediaId ?: return
+      if (!id.startsWith("sura_")) return
+      val rest = id.removePrefix("sura_")
+      val sura = rest.substringBefore("_").toIntOrNull() ?: return
+      val qariId = rest.substringAfter("_", missingDelimiterValue = "").toIntOrNull() ?: return
+
+      // Reconstruct AudioQueue for the new sura via the same entry point Auto uses.
+      val request = quranServiceCallback.buildAudioRequestInternal(sura, qariId) ?: return
+      startPlayback(request)
+    }
+
+    override fun onIsPlayingChanged(isPlaying: Boolean) {
+      recentPlaybackRecorder?.onIsPlayingChanged(isPlaying)
+    }
   }
 
   override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? = mediaLibrarySession
@@ -395,19 +504,10 @@ class AudioService : MediaLibraryService(), Player.Listener {
     } else if (ACTION_PLAYBACK == action) {
       val updatedAudioRequest = intent.getParcelableExtra<AudioRequest>(EXTRA_PLAY_INFO)
       if (updatedAudioRequest != null) {
-        audioRequest = updatedAudioRequest
-        val start = updatedAudioRequest.start
-        val basmallah = !updatedAudioRequest.isGapless() && start.requiresBasmallah()
-        audioQueue = AudioQueue(
-          quranInfo, updatedAudioRequest,
-          AudioPlaybackInfo(start, 1, 1, basmallah)
-        )
-        Timber.d("audio request has changed...")
-        player?.stop()
-        state = State.Stopped
-        Timber.d("stop if playing...")
+        startPlayback(updatedAudioRequest)
+      } else {
+        processTogglePlaybackRequest()
       }
-      processTogglePlaybackRequest()
     } else if (ACTION_PLAY == action) {
       processPlayRequest()
     } else if (ACTION_PAUSE == action) {
@@ -1350,11 +1450,15 @@ class AudioService : MediaLibraryService(), Player.Listener {
     Timber.i("debug: destroying the service")
     compositeDisposable.clear()
     state = State.Stopped
+    recentPlaybackRecorder?.clear()
+    recentPlaybackRecorder = null
+    player?.removeListener(playerTransitionListener)
     relaxResources(true, true)
     mediaSession.release()
     timingRepository.clear()
     scope.cancel()
     stopUpdateAudioPositionJob()
+    quranServiceCallback.detach()
     mediaLibrarySession?.release()
     mediaLibrarySession = null
     super.onDestroy()

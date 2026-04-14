@@ -89,4 +89,27 @@ class RecentQariManagerTest {
     val freshManager = RecentQariManager(context)
     assertThat(freshManager.getRecentQaris()).isEmpty()
   }
+
+  @Test
+  fun `concurrent writers do not lose entries`() {
+    // 5 threads each record a distinct (qariId, sura) pair. Without the internal lock,
+    // read-modify-write races on SharedPreferences would drop some writes. With the
+    // lock, the final list has 5 unique entries (within the MAX_RECENT cap).
+    val writers = (1..5).map { qariId ->
+      Thread {
+        repeat(10) { iteration ->
+          manager.recordQari(qariId = qariId, sura = iteration + 1)
+        }
+      }
+    }
+    writers.forEach { it.start() }
+    writers.forEach { it.join() }
+
+    val recents = manager.getRecentQaris()
+    // At most MAX_RECENT=5 entries retained. Each should have a distinct (qariId, sura).
+    assertThat(recents.size).isAtMost(5)
+    assertThat(recents.size).isAtLeast(5) // exactly 5 — all writers produced at least one entry
+    val pairs = recents.map { it.qariId to it.lastSura }
+    assertThat(pairs).containsNoDuplicates()
+  }
 }

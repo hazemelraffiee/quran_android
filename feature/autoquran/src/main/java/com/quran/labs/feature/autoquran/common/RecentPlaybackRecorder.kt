@@ -3,7 +3,7 @@ package com.quran.labs.feature.autoquran.common
 import android.os.SystemClock
 import androidx.media3.common.MediaItem
 
-internal class RecentPlaybackRecorder(
+class RecentPlaybackRecorder(
   private val delayedExecutor: DelayedExecutor,
   private val thresholdMs: Long = RECENT_PLAYBACK_THRESHOLD_MS,
   private val nowMs: () -> Long = { SystemClock.elapsedRealtime() },
@@ -96,7 +96,7 @@ internal class RecentPlaybackRecorder(
     }
   }
 
-  internal interface DelayedExecutor {
+  interface DelayedExecutor {
     fun postDelayed(runnable: Runnable, delayMs: Long)
     fun removeCallbacks(runnable: Runnable)
   }
